@@ -1,0 +1,995 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <DHT.h>
+#include <time.h>
+
+// =====================================================
+// WIFI
+// =====================================================
+
+#define WIFI_SSID "WIFI NAME"
+#define WIFI_PASSWORD "WIFI PASSWORD"
+
+
+// =====================================================
+// FIREBASE
+// =====================================================
+
+#define API_KEY "FIREBASE API KEY"
+
+#define DATABASE_URL "FIREBASE URL"
+
+#define USER_EMAIL "FIREBASE E-MAIL"
+#define USER_PASSWORD "FIREBASE PASSWORD"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// =====================================================
+// PINLER
+// =====================================================
+
+// Toprak nem sensörleri
+#define SOIL1_PIN 35
+#define SOIL2_PIN 32
+#define SOIL3_PIN 33
+#define SOIL4_PIN 25
+
+// Sıvı seviye sensörü
+#define WATER_LEVEL_PIN 34
+
+// DHT11
+#define DHT_PIN 4
+#define DHT_TYPE DHT11
+
+// Röleler
+#define RELAY1_PIN 13
+#define RELAY2_PIN 14
+#define RELAY3_PIN 27
+#define RELAY4_PIN 26
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// =====================================================
+// TOPRAK NEM KALİBRASYONU
+// =====================================================
+
+// 3400 = kuru
+// 2400 = ıslak
+
+#define SOIL_DRY 3400
+#define SOIL_WET 2400
+
+// =====================================================
+// SIVI SEVİYE KALİBRASYONU
+// =====================================================
+
+// 0 = boş
+// 1900 = tamamen dolu
+
+#define WATER_EMPTY 0
+#define WATER_FULL 1900
+
+// =====================================================
+// SENSÖR ZAMANLAMA
+// =====================================================
+
+unsigned long lastSensorRead = 0;
+
+const unsigned long SENSOR_INTERVAL = 3000;
+
+// =====================================================
+// SULAMA SİSTEMİ
+// =====================================================
+
+bool wateringActive[4] = {
+  false,
+  false,
+  false,
+  false
+};
+
+unsigned long wateringStartTime[4] = {
+  0,
+  0,
+  0,
+  0
+};
+
+unsigned long wateringDuration[4] = {
+  0,
+  0,
+  0,
+  0
+};
+
+// Firebase'deki son komutun kontrol zamanı
+unsigned long lastWateringCheck = 0;
+
+const unsigned long WATERING_CHECK_INTERVAL = 500;
+
+// =====================================================
+// POMPA PINLERİ
+// =====================================================
+
+int relayPins[4] = {
+  RELAY1_PIN,
+  RELAY2_PIN,
+  RELAY3_PIN,
+  RELAY4_PIN
+};
+
+// =====================================================
+// ANALOG OKUMA
+// =====================================================
+
+int readSoilSensor(int pin)
+{
+  long total = 0;
+  
+  // Pompa durdurma komutunun gecikmemesi için
+
+  for (int i = 0; i < 10; i++)
+  {
+    total += analogRead(pin);
+    delay(5);
+  }
+
+  int raw = total / 10;
+
+  int percent = map(
+    raw,
+    SOIL_DRY,
+    SOIL_WET,
+    0,
+    100
+  );
+
+  percent = constrain(percent, 0, 100);
+
+  return percent;
+}
+
+// =====================================================
+// SIVI SEVİYE OKUMA
+// =====================================================
+
+int readWaterLevel()
+{
+  long total = 0;
+
+  for (int i = 0; i < 10; i++)
+  {
+    total += analogRead(WATER_LEVEL_PIN);
+    delay(5);
+  }
+
+  int raw = total / 10;
+
+  int percent = map(
+    raw,
+    WATER_EMPTY,
+    WATER_FULL,
+    0,
+    100
+  );
+
+  percent = constrain(percent, 0, 100);
+
+  return percent;
+}
+
+// =====================================================
+// TARİH / SAAT
+// =====================================================
+
+String getDateTime()
+{
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo))
+  {
+    return "";
+  }
+
+  char buffer[25];
+
+  strftime(
+    buffer,
+    sizeof(buffer),
+    "%d.%m.%Y %H:%M",
+    &timeinfo
+  );
+
+  return String(buffer);
+}
+
+// =====================================================
+// POMPA DURDUR
+// =====================================================
+
+void stopPump(int index)
+{
+  if (index < 0 || index > 3)
+    return;
+
+  digitalWrite(
+    relayPins[index],
+    LOW
+  );
+
+  wateringActive[index] = false;
+
+  wateringStartTime[index] = 0;
+  wateringDuration[index] = 0;
+
+  Serial.print("Pompa ");
+  Serial.print(index + 1);
+  Serial.println(" durduruldu.");
+}
+
+// =====================================================
+// SULAMA TAMAMLANDI
+// =====================================================
+
+void finishWatering(int index)
+{
+  if (index < 0 || index > 3)
+    return;
+
+  // Pompayı kapat
+  digitalWrite(
+    relayPins[index],
+    LOW
+  );
+
+  wateringActive[index] = false;
+
+  wateringStartTime[index] = 0;
+  wateringDuration[index] = 0;
+
+  Serial.print("Pompa ");
+  Serial.print(index + 1);
+  Serial.println(" sulamayi tamamladı.");
+
+  // ---------------------------------------------------
+  // Pompanın hangi bitkiye atanmış olduğunu öğren
+  // ---------------------------------------------------
+
+  if (!Firebase.ready())
+    return;
+
+  String pumpPath =
+    "/plantSystem/pumps/pump" +
+    String(index + 1) +
+    "/assignedPlant";
+
+  if (Firebase.RTDB.getString(&fbdo, pumpPath))
+  {
+    String plantId = fbdo.stringData();
+
+    if (plantId.length() > 0)
+    {
+      String date = getDateTime();
+
+      if (date.length() > 0)
+      {
+        String plantDatePath =
+          "/plantSystem/plants/" +
+          plantId +
+          "/lastWatered";
+
+        Firebase.RTDB.setString(
+          &fbdo,
+          plantDatePath,
+          date
+        );
+
+        Serial.print("Son sulama tarihi guncellendi: ");
+        Serial.println(date);
+      }
+    }
+  }
+
+  // Firebase'deki sulama durumunu sıfırla
+
+  String basePath =
+    "/plantSystem/pumps/pump" +
+    String(index + 1) +
+    "/watering";
+
+  Firebase.RTDB.setBool(
+    &fbdo,
+    basePath + "/active",
+    false
+  );
+
+  Firebase.RTDB.setInt(
+    &fbdo,
+    basePath + "/remainingSeconds",
+    0
+  );
+
+  Firebase.RTDB.setInt(
+    &fbdo,
+    basePath + "/duration",
+    0
+  );
+}
+
+// =====================================================
+// SULAMAYI BAŞLAT
+// =====================================================
+
+void startWatering(
+  int index,
+  int duration
+)
+{
+  if (index < 0 || index > 3)
+    return;
+
+  if (duration <= 0)
+    return;
+
+  // Güvenlik:
+  // Maksimum 30 saniye
+  if (duration > 30)
+    duration = 30;
+
+  // Önce pompayı aç
+
+  digitalWrite(
+    relayPins[index],
+    HIGH
+  );
+
+  wateringActive[index] = true;
+
+  wateringStartTime[index] = millis();
+
+  wateringDuration[index] =
+    (unsigned long)duration * 1000UL;
+
+  Serial.print("Pompa ");
+  Serial.print(index + 1);
+  Serial.print(" sulamaya başladı. Süre: ");
+  Serial.print(duration);
+  Serial.println(" saniye");
+
+  // Firebase durumunu güncelle
+
+  if (Firebase.ready())
+  {
+    String basePath =
+      "/plantSystem/pumps/pump" +
+      String(index + 1) +
+      "/watering";
+
+    Firebase.RTDB.setBool(
+      &fbdo,
+      basePath + "/active",
+      true
+    );
+
+    Firebase.RTDB.setInt(
+      &fbdo,
+      basePath + "/remainingSeconds",
+      duration
+    );
+  }
+}
+
+// =====================================================
+// SULAMA KOMUTLARINI FIREBASE'DEN OKU
+// =====================================================
+
+void checkWateringCommands()
+{
+  if (!Firebase.ready())
+    return;
+
+  if (millis() - lastWateringCheck <
+      WATERING_CHECK_INTERVAL)
+  {
+    return;
+  }
+
+  lastWateringCheck = millis();
+
+  // ===================================================
+  //  POMPAYI KONTROL ET
+  // ===================================================
+
+  for (int i = 0; i < 4; i++)
+  {
+    String basePath =
+      "/plantSystem/pumps/pump" +
+      String(i + 1) +
+      "/watering";
+
+    bool activeCommand = false;
+    int duration = 0;
+
+    // -------------------------------------------------
+    // ACTIVE
+    // -------------------------------------------------
+
+    if (Firebase.RTDB.getBool(
+          &fbdo,
+          basePath + "/active"))
+    {
+      activeCommand = fbdo.boolData();
+    }
+
+    // -------------------------------------------------
+    // DURATION
+    // -------------------------------------------------
+
+    if (Firebase.RTDB.getInt(
+          &fbdo,
+          basePath + "/duration"))
+    {
+      duration = fbdo.intData();
+    }
+
+    // =================================================
+    // SULAMA BAŞLAT
+    // =================================================
+
+    if (activeCommand && !wateringActive[i])
+    {
+      if (duration > 0)
+      {
+        startWatering(
+          i,
+          duration
+        );
+      }
+    }
+
+    // =================================================
+    // ERKEN DURDURMA
+    // =================================================
+
+    if (!activeCommand && wateringActive[i])
+    {
+      Serial.print("Pompa ");
+      Serial.print(i + 1);
+      Serial.println(
+        " kullanici tarafindan durduruldu."
+      );
+
+      // Pompayı kapat
+      digitalWrite(
+        relayPins[i],
+        LOW
+      );
+
+      wateringActive[i] = false;
+
+      wateringStartTime[i] = 0;
+      wateringDuration[i] = 0;
+
+      // Erken durdurmada da sulama tarihi güncellensin
+  
+
+      String pumpPath =
+        "/plantSystem/pumps/pump" +
+        String(i + 1) +
+        "/assignedPlant";
+
+      if (Firebase.RTDB.getString(
+            &fbdo,
+            pumpPath))
+      {
+        String plantId =
+          fbdo.stringData();
+
+        if (plantId.length() > 0)
+        {
+          String date =
+            getDateTime();
+
+          if (date.length() > 0)
+          {
+            Firebase.RTDB.setString(
+              &fbdo,
+              "/plantSystem/plants/" +
+              plantId +
+              "/lastWatered",
+              date
+            );
+          }
+        }
+      }
+
+      Firebase.RTDB.setInt(
+        &fbdo,
+        basePath + "/remainingSeconds",
+        0
+      );
+
+      Firebase.RTDB.setInt(
+        &fbdo,
+        basePath + "/duration",
+        0
+      );
+    }
+  }
+}
+
+// =====================================================
+// SULAMA SÜRELERİNİ KONTROL ET
+// =====================================================
+
+void updateWatering()
+{
+  for (int i = 0; i < 4; i++)
+  {
+    if (!wateringActive[i])
+      continue;
+
+    unsigned long elapsed =
+      millis() - wateringStartTime[i];
+
+    // =================================================
+    // SÜRE DOLDU
+    // =================================================
+
+    if (elapsed >= wateringDuration[i])
+    {
+      finishWatering(i);
+      continue;
+    }
+
+    // =================================================
+    // KALAN SÜRE
+    // =================================================
+
+    unsigned long remaining =
+      wateringDuration[i] - elapsed;
+
+    int remainingSeconds =
+      (remaining + 999) / 1000;
+
+    // Firebase'e kalan süreyi yaz
+
+    if (Firebase.ready())
+    {
+      String basePath =
+        "/plantSystem/pumps/pump" +
+        String(i + 1) +
+        "/watering";
+
+      Firebase.RTDB.setInt(
+        &fbdo,
+        basePath + "/remainingSeconds",
+        remainingSeconds
+      );
+    }
+  }
+}
+
+// =====================================================
+// POMPA DURUMLARINI FIREBASE'DEN OKU
+// =====================================================
+
+void readPumpStates()
+{
+  if (!Firebase.ready())
+    return;
+
+  for (int i = 0; i < 4; i++)
+  {
+
+    if (wateringActive[i])
+      continue;
+
+    String path =
+      "/plantSystem/pumps/pump" +
+      String(i + 1) +
+      "/state";
+
+    int pumpState = 0;
+
+    if (Firebase.RTDB.getInt(
+          &fbdo,
+          path))
+    {
+      pumpState = fbdo.intData();
+    }
+
+    digitalWrite(
+      relayPins[i],
+      pumpState ? HIGH : LOW
+    );
+  }
+}
+
+// =====================================================
+// FIREBASE'E SENSÖRLERİ GÖNDER
+// =====================================================
+
+void sendSensorData()
+{
+  // =================================================
+  // TOPRAK NEM
+  // =================================================
+
+  int soil1 =
+    readSoilSensor(SOIL1_PIN);
+
+  int soil2 =
+    readSoilSensor(SOIL2_PIN);
+
+  int soil3 =
+    readSoilSensor(SOIL3_PIN);
+
+  int soil4 =
+    readSoilSensor(SOIL4_PIN);
+
+  // =================================================
+  // SIVI SEVİYE
+  // =================================================
+
+  int waterLevel =
+    readWaterLevel();
+
+  // =================================================
+  // DHT11
+  // =================================================
+
+  float temperature =
+    dht.readTemperature();
+
+  float humidity =
+    dht.readHumidity();
+
+  // =================================================
+  // SERIAL MONITOR
+  // =================================================
+
+  Serial.println();
+  Serial.println("===== SENSORLER =====");
+
+  Serial.print("Toprak sensor 1: %");
+  Serial.println(soil1);
+
+  Serial.print("Toprak sensor 2: %");
+  Serial.println(soil2);
+
+  Serial.print("Toprak sensor 3: %");
+  Serial.println(soil3);
+
+  Serial.print("Toprak sensor 4: %");
+  Serial.println(soil4);
+
+  Serial.print("Su seviyesi: %");
+  Serial.println(waterLevel);
+
+  if (
+    isnan(temperature) ||
+    isnan(humidity)
+  )
+  {
+    Serial.println(
+      "DHT11 okunamadi!"
+    );
+  }
+  else
+  {
+    Serial.print("Sicaklik: ");
+    Serial.print(temperature);
+    Serial.println(" C");
+
+    Serial.print("Hava nemi: %");
+    Serial.println(humidity);
+  }
+
+  Serial.println("=====================");
+
+  // =================================================
+  // FIREBASE
+  // =================================================
+
+  if (!Firebase.ready())
+  {
+    Serial.println(
+      "Firebase hazir degil."
+    );
+
+    return;
+  }
+
+  // =================================================
+  // TOPRAK SENSÖRLERİ
+  // =================================================
+
+  Firebase.RTDB.setInt(
+    &fbdo,
+    "/plantSystem/soilSensors/soilSensor1/value",
+    soil1
+  );
+
+  Firebase.RTDB.setInt(
+    &fbdo,
+    "/plantSystem/soilSensors/soilSensor2/value",
+    soil2
+  );
+
+  Firebase.RTDB.setInt(
+    &fbdo,
+    "/plantSystem/soilSensors/soilSensor3/value",
+    soil3
+  );
+
+  Firebase.RTDB.setInt(
+    &fbdo,
+    "/plantSystem/soilSensors/soilSensor4/value",
+    soil4
+  );
+
+  // =================================================
+  // SU SEVİYESİ
+  // =================================================
+
+  Firebase.RTDB.setInt(
+    &fbdo,
+    "/plantSystem/waterLevel",
+    waterLevel
+  );
+
+  // =================================================
+  // DHT11
+  // =================================================
+
+  if (
+    !isnan(temperature) &&
+    !isnan(humidity)
+  )
+  {
+    Firebase.RTDB.setFloat(
+      &fbdo,
+      "/plantSystem/dht11/temperature",
+      temperature
+    );
+
+    Firebase.RTDB.setFloat(
+      &fbdo,
+      "/plantSystem/dht11/humidity",
+      humidity
+    );
+  }
+
+  Serial.println(
+    "Firebase sensor verileri guncellendi."
+  );
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // =================================================
+  // RÖLE PINLERİ
+  // =================================================
+
+  pinMode(
+    RELAY1_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    RELAY2_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    RELAY3_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    RELAY4_PIN,
+    OUTPUT
+  );
+
+  // Başlangıçta tüm pompalar kapalı
+
+  digitalWrite(
+    RELAY1_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    RELAY2_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    RELAY3_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    RELAY4_PIN,
+    LOW
+  );
+
+  // =================================================
+  // ADC
+  // =================================================
+
+  analogReadResolution(12);
+
+  analogSetPinAttenuation(
+    SOIL1_PIN,
+    ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    SOIL2_PIN,
+    ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    SOIL3_PIN,
+    ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    SOIL4_PIN,
+    ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    WATER_LEVEL_PIN,
+    ADC_11db
+  );
+
+  // =================================================
+  // DHT11
+  // =================================================
+
+  dht.begin();
+
+  // =================================================
+  // WIFI
+  // =================================================
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  Serial.print(
+    "Wi-Fi baglaniyor"
+  );
+
+  while (
+    WiFi.status() != WL_CONNECTED
+  )
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println(
+    "Wi-Fi baglandi."
+  );
+
+  Serial.print("IP: ");
+  Serial.println(
+    WiFi.localIP()
+  );
+
+  // =================================================
+  // FIREBASE
+  // =================================================
+
+  config.api_key =
+    API_KEY;
+
+  config.database_url =
+    DATABASE_URL;
+
+  auth.user.email =
+    USER_EMAIL;
+
+  auth.user.password =
+    USER_PASSWORD;
+
+  Firebase.begin(
+    &config,
+    &auth
+  );
+
+  Firebase.reconnectWiFi(true);
+
+  Serial.println(
+    "Firebase baslatildi."
+  );
+
+  // =================================================
+  // NTP SAAT
+  // =================================================
+
+  configTime(
+    3 * 3600,
+    0,
+    "pool.ntp.org",
+    "time.nist.gov"
+  );
+
+  Serial.println(
+    "Saat senkronizasyonu baslatildi."
+  );
+
+  // =================================================
+  // ESP32 ONLINE
+  // =================================================
+
+  if (Firebase.ready())
+  {
+    Firebase.RTDB.setBool(
+      &fbdo,
+      "/plantSystem/esp32/online",
+      true
+    );
+
+    Serial.println(
+      "ESP32 online olarak isaretlendi."
+    );
+  }
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  if (Firebase.ready())
+  {
+    // -------------------------------------------------
+    // 1. SULAMA KOMUTLARINI KONTROL ET
+    // -------------------------------------------------
+
+    checkWateringCommands();
+
+    // -------------------------------------------------
+    // 2. AKTİF SULAMALARI KONTROL ET
+    // -------------------------------------------------
+
+    updateWatering();
+
+    // -------------------------------------------------
+    // 3. NORMAL POMPA STATE KONTROLÜ
+    // -------------------------------------------------
+
+    readPumpStates();
+
+    // -------------------------------------------------
+    // 4. SENSÖRLER
+    // -------------------------------------------------
+
+    if (
+      millis() - lastSensorRead >=
+      SENSOR_INTERVAL
+    )
+    {
+      lastSensorRead = millis();
+
+      sendSensorData();
+    }
+  }
+
+  delay(100);
+}

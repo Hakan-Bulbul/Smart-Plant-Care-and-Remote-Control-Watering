@@ -1,0 +1,58 @@
+{
+  "plantSystem": {
+
+    "esp32": {
+      "online": false
+    },
+
+    "dht11": {
+      "temperature": 0,
+      "humidity": 0
+    },
+
+    "waterLevel": 0,
+
+    "pumps": {
+      "pump1": {
+        "state": 0,
+        "assignedPlant": null
+      },
+      "pump2": {
+        "state": 0,
+        "assignedPlant": null
+      },
+      "pump3": {
+        "state": 0,
+        "assignedPlant": null
+      },
+      "pump4": {
+        "state": 0,
+        "assignedPlant": null
+      }
+    },
+
+    "soilSensors": {
+      "soilSensor1": {
+        "value": 0,
+        "assignedPlant": null
+      },
+      "soilSensor2": {
+        "value": 0,
+        "assignedPlant": null
+      },
+      "soilSensor3": {
+        "value": 0,
+        "assignedPlant": null
+      },
+      "soilSensor4": {
+        "value": 0,
+        "assignedPlant": null
+      }
+    },
+
+    "plants": {
+
+    }
+
+  }
+}
